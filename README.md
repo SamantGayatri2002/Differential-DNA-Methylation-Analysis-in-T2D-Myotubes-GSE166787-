@@ -90,7 +90,6 @@ Differential DNA Methylation Analysis in T2D Myotubes (GSE166787)
     │
     ├── Volcano_T2D_vs_NGT.png # Volcano plot (CpG-level)
     ├── GO_BP_bubble.png # Biological Process Bubble Plot
-    ├── workflow_diagram.png # Analysis workflow diagram
     │
     ├── Methylation_Data_T2D_Script.Rmd # Full analysis pipeline source
     ├── Methylation_Data_T2D_Script.pdf # Pipeline with plots + explanations
