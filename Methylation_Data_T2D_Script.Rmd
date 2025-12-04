@@ -1,0 +1,848 @@
+---
+title: "Methylation Analysis of Type2 Diabetics in Mature Muscle Cells"
+author: "Gayatri Samant"
+date: "`r Sys.Date()`"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r warning=FALSE}
+R.version.string
+BiocManager::version()
+
+```
+
+
+## This R script will Unzip .idat.gz Files and automatically create SampleSheet.csv for our 20 samples (10 NGT + 10 T2D) 
+
+```{r}
+# -----------------------
+# Create SampleSheet.csv for GSE166787
+# -----------------------
+
+library(dplyr)
+library(stringr)
+
+# Path to your raw IDAT files
+idat_dir <- "E:/Diabetic_Data/GSE166787_RAW"
+
+
+gz_files <- list.files(idat_dir, pattern = "\\.idat\\.gz$", full.names = TRUE)
+
+if (length(gz_files) > 0) {
+  message("Unzipping IDAT files...")
+  sapply(gz_files, function(f) {
+    out_f <- sub("\\.gz$", "", f)
+    if (!file.exists(out_f)) {
+      gunzip(f, remove = FALSE)
+    }
+  })
+}
+
+
+# List all IDAT files (already unzipped)
+files <- list.files(idat_dir, pattern = "idat$", full.names = FALSE)
+
+# Extract basenames (remove _Grn.idat or _Red.idat)
+basename <- str_replace(files, "_(Grn|Red)\\.idat$", "")
+basename <- unique(basename)
+
+# Extract GSM ID (before first "_")
+Sample_Name <- str_extract(basename, "^GSM\\d+")
+
+# Extract last 3 digits to classify samples
+Ending <- str_sub(Sample_Name, -3)
+
+# Define sample groups
+NGT_ids <- c("486","488","490","492","494","496","498","500","502","504")
+T2D_ids <- c("514","516","518","520","522","524","526","528","530","532")
+
+Group <- ifelse(Ending %in% NGT_ids, "NGT",
+         ifelse(Ending %in% T2D_ids, "T2D", NA))
+
+# Build final SampleSheet (only valid 20 samples)
+df <- data.frame(
+  Sample_Name = Sample_Name,
+  Group = Group,
+  Basename = basename,
+  stringsAsFactors = FALSE
+) %>%
+  filter(!is.na(Group)) %>%
+  arrange(Group)
+
+# Save SampleSheet
+write.csv(df, file = file.path(idat_dir, "SampleSheet.csv"), row.names = FALSE)
+
+print("SampleSheet.csv created successfully!")
+print(df)
+```
+
+
+
+# =============================
+# 1. Install Required Packages
+# =============================
+```{r}
+# # If missing — install BiocManager
+# # install.packages("BiocManager")
+# # BiocManager::install(version = "3.17", ask = FALSE)
+# 
+# # Bioconductor core packages
+# # BiocManager::install(c(
+# #   "minfi",
+# #   "limma",
+# #   "GenomicRanges",
+# #   "GenomicFeatures",
+# #   "rGREAT",
+# #   "DMRcate"
+# # ))
+# 
+# # CRAN packages
+# # install.packages(c("tidyverse", "R.utils"))
+# 
+# # 450k annotation & manifest (manual install due to older versions)
+# if (!requireNamespace("remotes", quietly = TRUE)) install.packages("remotes")
+# 
+# remotes::install_url(
+#   "https://bioconductor.org/packages/release/data/annotation/src/contrib/IlluminaHumanMethylation450kmanifest_0.4.0.tar.gz"
+# )
+# 
+# remotes::install_url(
+#   "https://bioconductor.org/packages/release/data/annotation/src/contrib/IlluminaHumanMethylation450kanno.ilmn12.hg19_0.6.0.tar.gz"
+# )
+# 
+# BiocManager::install("IlluminaHumanMethylation450kanno.ilmn12.hg19")
+# 
+# # DMRcate dependency
+# BiocManager::install("IlluminaHumanMethylationEPICanno.ilm10b4.hg19")
+# 
+# # rGREAT dependencies
+# BiocManager::install(c(
+#   "TxDb.Hsapiens.UCSC.hg19.knownGene",
+#   "TxDb.Hsapiens.UCSC.hg38.knownGene"
+# ))
+
+```
+
+
+
+=============================
+2. Load All Required Libraries
+=============================
+```{r message=FALSE, warning=FALSE}
+library(minfi)
+library(limma)
+library(GenomicRanges)
+library(GenomicFeatures)
+library(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+library(DMRcate)
+library(rGREAT)
+library(tidyverse)
+library(R.utils)
+```
+
+
+
+=============================
+3. Set Project Paths
+=============================
+```{r}
+base_dir <- "E:/Diabetic_Data"
+idat_dir <- file.path(base_dir, "GSE166787_RAW")
+sample_sheet_path <- file.path(idat_dir, "SampleSheet.csv")
+
+list.files(idat_dir)[1:20]
+# If it shows 40 files (20 IDAT pairs), then the command ran currectly.
+
+```
+
+
+
+
+=============================
+5. Load Sample Sheet
+=============================
+our SampleSheet.csv has:
+Sample_Name	Group	Basename
+
+```{r}
+sample_sheet <- read.csv(sample_sheet_path, stringsAsFactors = FALSE)
+head(sample_sheet)
+```
+
+=============================
+6. Load Raw IDAT Files
+=============================
+Expected: ~622,000 probes × 20 samples.
+```{r}
+rgSet <- read.metharray.exp(
+  targets = sample_sheet,
+  extended = TRUE,
+  base = idat_dir
+)
+
+rgSet
+```
+=============================
+7. Detection P-Values (QC)
+=============================
+With 20 high-quality samples, expect no failures.
+```{r}
+detP <- detectionP(rgSet)
+
+summary(as.vector(detP))
+
+# Remove poor-quality samples
+failed_samples <- colMeans(detP > 0.01) > 0.05
+sample_sheet <- sample_sheet[!failed_samples, ]
+rgSet <- rgSet[, !failed_samples]
+
+# Remove poor-quality probes
+failed_probes <- rowMeans(detP > 0.01) > 0.05
+rgSet <- rgSet[!failed_probes, ]
+```
+
+=============================
+8. Normalization (NOOB)
+=============================
+```{r}
+mSet.noob <- preprocessNoob(rgSet)
+
+qc <- getQC(mSet.noob)
+plotQC(qc)
+```
+
+
+=============================
+9. Extract Beta & M-values
+=============================
+```{r}
+# Methylation metrix
+beta <- getBeta(mSet.noob)
+mval <- getM(mSet.noob)
+dim(beta)
+densityPlot(beta, main = "Beta-value distributions after NOOB", legend = FALSE)
+```
+
+=============================
+10. Probe Filtering
+=============================
+```{r}
+
+# A) Map to Genome
+grSet <- mapToGenome(mSet.noob)
+
+# B) Remove SNP-overlapping CpGs
+mSet.clean <- dropLociWithSnps(grSet)
+beta <- getBeta(mSet.clean)
+mval <- getM(mSet.clean)
+
+# C) Remove sex-chromosome CpGs (muscle cells → safe)
+anno <- getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
+anno <- anno[rownames(beta), ]
+
+sex_probes <- anno$chr %in% c("chrX", "chrY")
+beta <- beta[!sex_probes, ]
+mval <- mval[!sex_probes, ]
+```
+
+
+
+=============================
+11. PCA (Unsupervised QC)
+=============================
+
+Expected:
+With 20 samples → clear clustering of NGT vs T2D on PC1 or PC2.
+```{r}
+
+topVar <- order(rowVars(mval), decreasing = TRUE)[1:5000]
+pca <- prcomp(t(mval[topVar, ]))
+
+pca_df <- data.frame(
+  PC1 = pca$x[,1],
+  PC2 = pca$x[,2],
+  Group = sample_sheet$Group
+)
+
+ggplot(pca_df, aes(PC1, PC2, color = Group)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(title = "PCA of 20 Muscle Samples (NGT vs T2D)")
+
+```
+
+=============================
+12. Design Matrix (NGT = Control)
+=============================
+This models:
+T2D effect = T2D – NGT
+
+```{r}
+sample_sheet$Group <- factor(sample_sheet$Group, levels = c("NGT", "T2D"))
+design <- model.matrix(~ Group, data = sample_sheet)
+design
+```
+
+
+=====================================
+13. Differential Methylation (limma)
+=====================================
+
+In muscle-derived methylation datasets, T2D effects are subtle, so PCA may not show separation, but limma will still detect probe-level statistical differences.
+```{r}
+# Fit linear model and compute moderated statistics
+fit <- lmFit(mval, design)
+fit <- eBayes(fit)
+
+# Extract ALL CpGs ranked by significance
+topCpGs <- topTable(fit, coef = "GroupT2D", number = Inf)
+
+# Preview table
+head(topCpGs)
+
+```
+
+
+===========================================
+14 . Save CpG-Level Results
+===========================================
+
+#### Convert your topCpGs to a clean data.frame
+
+```{r}
+mean_T2D <- rowMeans(beta[, sample_sheet$Group == "T2D"])
+mean_NGT <- rowMeans(beta[, sample_sheet$Group == "NGT"])
+
+probe_delta <- mean_T2D - mean_NGT
+
+# Convert limma Bioconductor object to a clean data.frame
+topCpGs_df <- as.data.frame(topCpGs)
+
+# Add CpG name
+topCpGs_df$CpG <- rownames(topCpGs)
+
+# Add gene annotation
+topCpGs_df$gene <- anno[topCpGs_df$CpG, "UCSC_RefGene_Name"]
+
+# Add deltaBeta for CpGs
+topCpGs_df$deltaBeta <- probe_delta[match(topCpGs_df$CpG, names(probe_delta))]
+
+# Clean gene annotation 
+# The initial annotation may assign multiple genes, so we consider 1st gene while plotting
+topCpGs_df$gene_label <- ifelse(
+  topCpGs_df$gene == "" | is.na(topCpGs_df$gene),
+  NA,
+  sapply(strsplit(topCpGs_df$gene, ";"), `[`, 1)  # take the first gene
+)
+
+
+```
+
+Now topCpGs_df is your main table for CpG-level saving and plotting.
+
+#### Save complete CpG table
+
+```{r}
+out_dir <- "E:/Diabetic_Data/"
+
+write.csv(topCpGs_df,
+          file.path(out_dir, "DMP_all_CpGs.csv"),
+          row.names = FALSE)
+```
+
+#### Save Top 10 Hyper / Hypo CpGs
+
+```{r}
+
+# Top 10 hyper
+top10_hyper <- topCpGs_df[order(-topCpGs_df$deltaBeta), ][1:10, ]
+write.csv(top10_hyper, file.path(out_dir, "Top10_hyper_CpGs.csv"), row.names = FALSE)
+
+# Top 10 hypo
+top10_hypo <- topCpGs_df[order(topCpGs_df$deltaBeta), ][1:10, ]
+write.csv(top10_hypo, file.path(out_dir, "Top10_hypo_CpGs.csv"), row.names = FALSE)
+
+```
+
+
+#### Volcano plot showing Hyper and Hypo methylated Genes
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# Add neglogFDR to main table
+volc_df <- topCpGs_df
+volc_df$neglogFDR <- -log10(volc_df$adj.P.Val)
+
+# Add neglogFDR to top lists
+top10_hyper$neglogFDR <- -log10(top10_hyper$adj.P.Val)
+top10_hypo$neglogFDR  <- -log10(top10_hypo$adj.P.Val)
+
+gg_volcano <- ggplot(volc_df, aes(deltaBeta, neglogFDR)) +
+  geom_point(alpha = 0.4, size = 0.8, color = "grey60") +
+
+  geom_point(data = top10_hyper,
+             aes(deltaBeta, neglogFDR),
+             color = "red", size = 2.5) +
+
+  geom_point(data = top10_hypo,
+             aes(deltaBeta, neglogFDR),
+             color = "blue", size = 2.5) +
+
+  geom_text_repel(
+    data = rbind(top10_hyper, top10_hypo),
+    aes(deltaBeta, neglogFDR, label = gene_label),
+    size = 3,
+    box.padding = 0.4,
+    max.overlaps = 100,
+    segment.color = "black"
+  ) +
+
+  theme_minimal(base_size = 16) +
+  labs(
+    title = "Volcano Plot: T2D vs NGT (CpGs)",
+    x = "Delta Beta (T2D - NGT)",
+    y = "-log10(FDR-adjusted P-value)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", hjust = 0.5),
+    plot.margin = margin(20, 20, 20, 20)
+  )
+
+# Save
+ggsave(file.path(out_dir, "Volcano_T2D_vs_NGT.png"),
+       plot = gg_volcano,
+       width = 12, height = 8, dpi = 300)
+
+print(gg_volcano)
+
+
+```
+
+Grey cloud = all CpGs
+
+Red = top 10 hyper (T2D hypermethylated)
+
+Blue = top 10 hypo (T2D hypomethylated)
+
+
+#### Heatmap of Top 500 CpGs
+```{r}
+# install.packages("pheatmap")
+
+library(matrixStats)
+library(pheatmap)
+
+# Select top 500 variable CpGs
+top20 <- order(rowVars(beta), decreasing = TRUE)[1:20]
+beta_top20 <- beta[top20, ]
+
+# Annotation
+annotation_col <- data.frame(Group = sample_sheet$Group)
+rownames(annotation_col) <- colnames(beta_top20)
+
+# Plot heatmap
+pheatmap(
+  beta_top20,
+  annotation_col = annotation_col,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = FALSE,
+  main = "Top 20 Most Variable CpGs (Beta values)"
+)
+
+
+
+```
+
+
+=====================================
+14. DMRcate — Region-Based Differential Methylation
+=====================================
+This step matters because,
+
+- In tissues like skeletal muscle:
+- Individual CpG effects are small
+- Few CpGs survive FDR at probe-level
+- BUT CpGs cluster into regions of consistent hyper/hypomethylation
+
+So DMRcate detects regional methylation shifts that are more biologically meaningful.
+
+
+
+#### 14.1 Attempt probe-level annotation (will likely return warning)
+⚠ EXPECTED WARNING:
+Your contrast returned no individually significant probes.
+```{r}
+myAnnotation <- cpg.annotate(
+  datatype = "array",
+  what = "M",
+  object = mval,
+  analysis.type = "differential",
+  design = design,
+  coef = "GroupT2D"
+)
+```
+
+
+This is normal for muscle T2D datasets → proceed with relaxed thresholds.
+
+
+=====================================
+15. DMRcate (Relaxed Thresholds to Detect Regions)
+=====================================
+- We set FDR = 1 in cpg.annotate → keep ALL CpGs
+- We control significance at the region level using pcutoff
+- This is standard in low-effect tissues
+
+```{r}
+myAnnotation <- cpg.annotate(
+  datatype = "array",
+  what = "M",
+  object = mval,
+  analysis.type = "differential",
+  design = design,
+  coef = "GroupT2D",
+  fdr = 1            # keep all probes (no FDR cut at probe level)
+)
+
+dmr_results <- dmrcate(
+  myAnnotation,
+  lambda = 1000,
+  C = 2,
+  pcutoff = 0.05     # region seeding threshold
+)
+
+print(dmr_results)
+```
+
+
+This means your T2D signal is regional — GOOD!
+
+=====================================
+16. Extract and Save DMR Regions
+=====================================
+```{r}
+slotNames(dmr_results)
+# All DMR information is stored across these slots.
+
+```
+
+
+**Understanding what each slot contains**
+
+- coord	--> Genomic coordinates in the form "chr:start-end"
+- no.cpgs -->	Number of CpGs in each DMR
+- min_smoothed_fdr --> Minimum smoothed FDR across region
+- Stouffer-->	Stouffer region statistic
+- HMFDR-->	Region-level FDR
+- Fisher-->	Fisher combined p-value
+- maxdiff-->	Maximum Δβ within region
+- meandiff -->	Mean Δβ within region
+
+So all we need to do is:
+
+- Parse the "coord" slot into chromosome, start, end.
+- Combine all slots into a table.
+- Convert to GRanges.
+
+
+```{r}
+
+# STEP 1 — Extract DMR table from slots
+dmr_coord <- dmr_results@coord
+dmr_no_cpgs <- dmr_results@no.cpgs
+dmr_minFDR <- dmr_results@min_smoothed_fdr
+dmr_Stouffer <- dmr_results@Stouffer
+dmr_HMFDR <- dmr_results@HMFDR
+dmr_Fisher <- dmr_results@Fisher
+dmr_maxdiff <- dmr_results@maxdiff
+dmr_meandiff <- dmr_results@meandiff
+
+
+# STEP 2 — Parse the genomic coordinates
+
+library(stringr)
+library(dplyr)
+
+coord_df <- data.frame(coord = dmr_coord, stringsAsFactors = FALSE) %>%
+  tidyr::separate(coord, into = c("chr", "pos"), sep = ":", remove = TRUE) %>%
+  tidyr::separate(pos, into = c("start", "end"), sep = "-", remove = TRUE)
+
+coord_df$start <- as.numeric(coord_df$start)
+coord_df$end   <- as.numeric(coord_df$end)
+
+# STEP 3 — Combine into full DMR table
+dmr_df <- data.frame(
+  chr = coord_df$chr,
+  start = coord_df$start,
+  end = coord_df$end,
+  no.cpgs = dmr_no_cpgs,
+  min_smoothed_fdr = dmr_minFDR,
+  Stouffer = dmr_Stouffer,
+  HMFDR = dmr_HMFDR,
+  Fisher = dmr_Fisher,
+  maxdiff = dmr_maxdiff,
+  meandiff = dmr_meandiff,
+  stringsAsFactors = FALSE
+)
+
+
+# Check:
+
+head(dmr_df)
+
+# STEP 4 — Convert to GRanges
+
+library(GenomicRanges)
+
+dmr_ranges <- GRanges(
+  seqnames = dmr_df$chr,
+  ranges = IRanges(start = dmr_df$start, end = dmr_df$end),
+  no.cpgs = dmr_df$no.cpgs,
+  min_smoothed_fdr = dmr_df$min_smoothed_fdr,
+  Stouffer = dmr_df$Stouffer,
+  HMFDR = dmr_df$HMFDR,
+  Fisher = dmr_df$Fisher,
+  maxdiff = dmr_df$maxdiff,
+  meandiff = dmr_df$meandiff
+)
+
+dmr_ranges
+
+
+# STEP 5 — Save
+out_dir<-"E:/Diabetic_Data"
+write.csv(as.data.frame(dmr_ranges),
+          file.path(out_dir, "DMRs_final_manual_extraction.csv"),
+          row.names = FALSE)
+```
+
+
+=====================================
+17. Compute Mean ΔBeta for Each DMR
+=====================================
+
+We compute the average methylation difference inside the region.
+This gives effect size at the region level.
+
+```{r}
+
+# Compute deltaBeta for each probe
+mean_T2D <- rowMeans(beta[, sample_sheet$Group == "T2D"])
+mean_NGT <- rowMeans(beta[, sample_sheet$Group == "NGT"])
+probe_delta <- mean_T2D - mean_NGT
+
+probe_anno <- anno[rownames(beta), c("chr", "pos")]
+probe_gr <- GRanges(seqnames = probe_anno$chr,
+                    ranges = IRanges(start = probe_anno$pos,
+                                     end = probe_anno$pos),
+                    CpG = rownames(beta),
+                    deltaBeta = probe_delta)
+
+# For each DMR: extract probes + compute mean deltaBeta
+dmr_means <- sapply(seq_along(dmr_ranges), function(i) {
+  ol <- findOverlaps(dmr_ranges[i], probe_gr)
+  mean(mcols(probe_gr[subjectHits(ol)])$deltaBeta, na.rm = TRUE)
+})
+
+dmr_df <- as.data.frame(dmr_ranges)
+dmr_df$mean_deltaBeta <- dmr_means
+
+write.csv(dmr_df,
+          file.path(out_dir, "DMRs_with_mean_deltaBeta.csv"),
+          row.names = FALSE)
+```
+
+
+=====================================
+18. Annotate DMRs with Gene Names
+=====================================
+```{r}
+# Use UCSC_RefGene_Name column
+dmr_genes <- sapply(seq_along(dmr_ranges), function(i) {
+  ol <- findOverlaps(dmr_ranges[i], probe_gr)
+  probes <- names(probe_gr[subjectHits(ol)])
+  genes <- unique(anno[probes, "UCSC_RefGene_Name"])
+  genes <- genes[genes != ""]
+  if (length(genes) == 0) return(NA)
+  paste(unique(unlist(strsplit(genes, ";"))), collapse = ";")
+})
+
+dmr_df$genes <- dmr_genes
+
+write.csv(dmr_df,
+          file.path(out_dir, "DMRs_annotated.csv"),
+          row.names = FALSE)
+
+```
+
+
+
+
+==============================================
+20. GREAT Enrichment (Optional but Recommended)
+==============================================
+
+SECTION 1 — GREAT Submission
+
+```{r warning=FALSE}
+library(rGREAT)
+
+# Submit DMRs to GREAT (hg19 is correct for 450k annotation)
+job <- submitGreatJob(dmr_ranges, species = "hg19")
+
+# Retrieve GO tables
+go_tables <- getEnrichmentTables(job)
+names(go_tables)
+```
+SECTION 2 — Extract Each GO Category
+
+```{r}
+go_bp <- go_tables[["GO Biological Process"]]
+go_mf <- go_tables[["GO Molecular Function"]]
+go_cc <- go_tables[["GO Cellular Component"]]
+```
+
+```{r}
+# Convert GO tables to regular data.frames (removes Rle)
+go_bp <- as.data.frame(lapply(go_bp, as.vector))
+go_mf <- as.data.frame(lapply(go_mf, as.vector))
+go_cc <- as.data.frame(lapply(go_cc, as.vector))
+
+# fix the rownames:
+rownames(go_bp) <- NULL
+rownames(go_mf) <- NULL
+rownames(go_cc) <- NULL
+
+```
+
+```{r}
+# Check structure to confirm:
+str(go_bp)
+
+```
+
+
+
+SECTION 3 — Save GO Tables
+```{r}
+out_dir <- "E:/Diabetic_Data/GREAT_results"
+dir.create(out_dir, showWarnings = FALSE)
+
+write.csv(go_bp, file.path(out_dir, "GREAT_GO_BP.csv"), row.names = FALSE)
+write.csv(go_mf, file.path(out_dir, "GREAT_GO_MF.csv"), row.names = FALSE)
+write.csv(go_cc, file.path(out_dir, "GREAT_GO_CC.csv"), row.names = FALSE)
+```
+
+SECTION 4 — BEAUTIFUL GO PLOTS (Top 10 Terms)
+
+```{r}
+library(ggplot2)
+library(stringr)
+
+plot_great_go <- function(go_df, title_text) {
+  
+  # Sort by raw p-value (ascending)
+  ord <- order(go_df$Hyper_Raw_PValue, na.last = NA)
+  
+  df2 <- go_df[ord[1:10], ]   # top 10
+  
+  df2$neglogP <- -log10(df2$Hyper_Raw_PValue)
+  
+  # Wrap long labels for visibility
+  df2$name_wrapped <- str_wrap(df2$name, width = 50)
+  
+  # Reorder for plotting
+  df2$name_wrapped <- factor(df2$name_wrapped,
+                             levels = rev(df2$name_wrapped))
+  
+  ggplot(df2, aes(x = name_wrapped, y = neglogP, fill = neglogP)) +
+    geom_col(width = 0.8, color = "black", alpha = 0.9) +
+    coord_flip() +
+    scale_fill_gradient(low = "skyblue", high = "darkblue") +
+    
+    # Wide plot theme adjustments
+    theme_minimal(base_size = 16) +
+    labs(
+      title = title_text,
+      x = "",
+      y = "-log10(raw P-value)"
+    ) +
+    theme(
+      plot.title = element_text(face = "bold", size = 20, hjust = 0.5),
+      axis.text = element_text(color = "black", size = 14),
+      legend.position = "none",
+      
+      # Extra margin on the left to avoid label trimming
+      plot.margin = margin(t = 20, r = 20, b = 20, l = 80)
+    )
+}
+
+```
+
+
+
+```{r, fig.width=14, fig.height=6}
+
+plot_great_go(go_bp, "GREAT Enrichment: Biological Process (Top 10)")
+```
+
+
+
+```{r, fig.width=14, fig.height=6}
+
+plot_great_go(go_mf, "GREAT Enrichment: Molecular function (Top 10)")
+```
+
+```{r, fig.width=14, fig.height=6}
+
+plot_great_go(go_cc, "GREAT Enrichment: Cellular Component (Top 10)")
+```
+
+#### GREAT Bubble Plot on Biological Process
+```{r}
+library(ggplot2)
+plot_great_bubble <- function(go_df, title) {
+  ord <- order(go_df$Hyper_Raw_PValue)
+  df2 <- go_df[ord[1:10], ]
+  df2$neglogP <- -log10(df2$Hyper_Raw_PValue)
+
+  ggplot(df2, aes(x = neglogP, y = name)) +
+    geom_point(aes(size = Hyper_Fold_Enrichment, color = neglogP), alpha = 0.9) +
+    scale_color_gradient(low = "orange", high = "red") +
+    scale_size(range = c(3, 12)) +
+    theme_minimal(base_size = 14) +
+    labs(title = title, x = "-log10(raw P-value)", y = "") +
+    theme(plot.title = element_text(face = "bold", size = 16))
+}
+
+ggsave("GO_BP_bubble.png",
+       plot = plot_great_bubble(go_bp, "GREAT: BP Bubble Plot"),
+       width = 10, height = 6, dpi = 300)
+
+```
+
+
+### Save Session Info
+```{r}
+# Capture sessionInfo() output as text
+si_text <- capture.output(sessionInfo())
+
+# Print first 10 lines
+cat(si_text[1:20], sep = "\n")
+
+```
+
+
+
+
+
+
+
